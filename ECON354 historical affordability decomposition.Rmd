@@ -1,0 +1,186 @@
+---
+title: "ECON 354 term project (historical decomp)"
+author: "Mia Levcovich"
+date: "2026-11-20"
+output: html_document
+---
+```{r load-historical-data, echo=TRUE}
+library(dplyr)
+
+folder <- "/Users/mialevcovich/Desktop/fall courses 2026/ECON 354/econ354 term project"
+
+prices <- read.csv(
+  file.path(folder, "House_Price_Index.csv"),
+  skip = 2,
+  header = FALSE
+)
+
+toronto_prices <- prices |>
+  filter(grepl("^[A-Za-z]{3}-[0-9]{4}$", V1)) |>
+  transmute(
+    date = as.Date(sprintf(
+      "%s-%02d-01",
+      substr(V1, 5, 8),
+      match(substr(V1, 1, 3), month.abb)
+    )),
+    teranet_index = as.numeric(V37)
+  )
+
+rates <- read.csv(
+  file.path(folder, "RATES_MORTGAGES-2013-01-01.csv"),
+  skip = 40
+)
+
+mortgage_rates <- rates |>
+  transmute(
+    date = as.Date(paste0(substr(date, 1, 7), "-01")),
+    mortgage_rate_pct = as.numeric(V122667786)
+  )
+
+toronto_income <- read.csv(
+  file.path(folder, "Total_income_STATCAN.csv"),
+  fileEncoding = "UTF-8-BOM"
+) |>
+  filter(VECTOR == "v21188037") |>
+  transmute(
+    year = as.integer(REF_DATE),
+    annual_income = as.numeric(VALUE)
+  )
+
+toronto <- toronto_prices |>
+  inner_join(mortgage_rates, by = "date") |>
+  mutate(year = as.integer(format(date, "%Y"))) |>
+  inner_join(toronto_income, by = "year") |>
+  filter(
+    is.finite(teranet_index), teranet_index > 0,
+    is.finite(mortgage_rate_pct),
+    is.finite(annual_income), annual_income > 0
+  ) |>
+  arrange(date)
+
+stopifnot(nrow(toronto) > 0L)
+```
+
+```{r historical-decomposition, echo=TRUE}
+amortization_years <- 25
+n_payments <- 12 * amortization_years
+
+toronto_decomposition <- toronto |>
+  mutate(
+    # Convert the quoted annual rate to an effective monthly rate.
+    annual_rate = mortgage_rate_pct / 100,
+    monthly_rate = (1 + annual_rate / 2)^(1 / 6) - 1,
+
+    # Monthly mortgage payment per dollar borrowed.
+    payment_factor = if_else(
+      monthly_rate == 0,
+      1 / n_payments,
+      monthly_rate / (1 - (1 + monthly_rate)^(-n_payments))
+    ),
+
+    # Each contribution is measured relative to the first usable year.
+    price_contribution = 100 * log(teranet_index / first(teranet_index)),
+    rate_contribution = 100 * log(payment_factor / first(payment_factor)),
+    income_contribution = -100 * log(annual_income / first(annual_income)),
+
+    total_log_change = price_contribution + rate_contribution +
+      income_contribution,
+
+    # Convert log points to an ordinary percentage change in PTI.
+    pti_percent_change = 100 * expm1(total_log_change / 100)
+  )
+```
+
+```{r interactive-decomposition, echo=TRUE}
+library(plotly)
+
+monthly <- toronto_decomposition
+yearly <- monthly[format(monthly$date, "%m") == "12", ]
+
+# Format the black line's hover label.
+net_hover <- function(data) {
+  sprintf(
+    "%+.2f log points<br>%+.2f%% relative to the starting month",
+    data$total_log_change,
+    data$pti_percent_change
+  )
+}
+
+# Supply new dates and values for the three bars and the black line.
+view_args <- function(data, hover_format) {
+  dates <- format(data$date, "%Y-%m-%d")
+
+  list(
+    list(
+      x = rep(list(dates), 4),
+      y = list(
+        data$price_contribution,
+        data$rate_contribution,
+        data$income_contribution,
+        data$total_log_change
+      ),
+      text = list("", "", "", net_hover(data))
+    ),
+    list(
+      "xaxis.autorange" = TRUE,
+      "xaxis.hoverformat" = hover_format
+    )
+  )
+}
+
+plot_ly(monthly, x = ~format(date, "%Y-%m-%d")) |>
+  add_bars(
+    y = ~price_contribution,
+    name = "Home prices",
+    hovertemplate = "%{y:+.2f} log points"
+  ) |>
+  add_bars(
+    y = ~rate_contribution,
+    name = "Mortgage rates",
+    hovertemplate = "%{y:+.2f} log points"
+  ) |>
+  add_bars(
+    y = ~income_contribution,
+    name = "Median family income",
+    hovertemplate = "%{y:+.2f} log points"
+  ) |>
+  add_lines(
+    y = ~total_log_change,
+    name = "Net change in PTI",
+    line = list(color = "#222222", width = 3),
+    text = net_hover(monthly),
+    hovertemplate = "%{text}"
+  ) |>
+  layout(
+    barmode = "relative",
+    hovermode = "x unified",
+    margin = list(t = 65),
+    xaxis = list(
+      title = "Date",
+      type = "date",
+      tickformat = "%Y",
+      hoverformat = "%b %Y",
+      rangeslider = list(visible = TRUE)
+    ),
+    yaxis = list(title = "Contribution since the starting month (log points)"),
+    updatemenus = list(list(
+      type = "buttons",
+      direction = "right",
+      x = 0,
+      xanchor = "left",
+      y = 1.15,
+      buttons = list(
+        list(
+          label = "Monthly",
+          method = "update",
+          args = view_args(monthly, "%b %Y")
+        ),
+        list(
+          label = "Yearly (December)",
+          method = "update",
+          args = view_args(yearly, "%Y")
+        )
+      )
+    ))
+  )
+```
